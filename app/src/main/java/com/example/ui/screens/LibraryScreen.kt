@@ -26,10 +26,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.database.PicoFile
-import com.example.serial.MicroPythonHelper
 import com.example.serial.TransferState
 import com.example.viewmodel.MainViewModel
-import java.nio.charset.StandardCharsets
 
 @Composable
 fun LibraryScreen(
@@ -38,9 +36,6 @@ fun LibraryScreen(
 ) {
     val files by viewModel.filesList.collectAsStateWithLifecycle()
     val transferState by viewModel.transferState.collectAsStateWithLifecycle()
-    val sda by viewModel.sdaPin.collectAsStateWithLifecycle()
-    val scl by viewModel.sclPin.collectAsStateWithLifecycle()
-    val delay by viewModel.frameDelay.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     // Dialog control states
@@ -97,13 +92,13 @@ fun LibraryScreen(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = "MicroPython Animation & Script Storage",
+                    text = "Microcontroller anims/ Storage",
                     fontSize = 15.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
                 )
                 Text(
-                    text = "Upload animations (.bin) to 'anims/' directory (1024 B/frame for 128x64 OLED) and Python scripts (.py, .mpy) to device flash.",
+                    text = "Upload animations (.bin) to 'anims/' directory (1024 B/frame) or load official presets directly from GitHub.",
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
                     textAlign = TextAlign.Center,
@@ -118,11 +113,9 @@ fun LibraryScreen(
                         onClick = { filePickerLauncher.launch("*/*") },
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(12.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.primary
-                        )
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                     ) {
-                        Icon(Icons.Default.CloudUpload, contentDescription = "Upload")
+                        Icon(Icons.Default.CloudUpload, contentDescription = "Upload", modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("Pick File", fontSize = 12.sp)
                     }
@@ -132,9 +125,9 @@ fun LibraryScreen(
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(12.dp),
                     ) {
-                        Icon(Icons.Default.Download, contentDescription = "Presets")
+                        Icon(Icons.Default.CloudDownload, contentDescription = "Presets", modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Add Presets", fontSize = 12.sp)
+                        Text("GitHub Presets", fontSize = 11.sp)
                     }
                 }
             }
@@ -165,25 +158,28 @@ fun LibraryScreen(
         ) {
             Column {
                 Text(
-                    text = "Microcontroller Partition",
-                    fontSize = 17.sp,
+                    text = "anims/ Directory Partition",
+                    fontSize = 16.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onBackground
                 )
                 Text(
-                    text = "${files.size} active files in 'anims/' and root",
+                    text = "${files.size} active animation(s) in flash memory",
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)
                 )
             }
 
             IconButton(
-                onClick = { viewModel.refreshFileList() },
+                onClick = {
+                    viewModel.refreshFileList()
+                    Toast.makeText(context, "Syncing anims/ directory...", Toast.LENGTH_SHORT).show()
+                },
                 colors = IconButtonDefaults.iconButtonColors(
                     containerColor = MaterialTheme.colorScheme.surface
                 )
             ) {
-                Icon(Icons.Default.Sync, contentDescription = "Sync indexes")
+                Icon(Icons.Default.Sync, contentDescription = "Sync indexes", tint = MaterialTheme.colorScheme.primary)
             }
         }
 
@@ -206,12 +202,12 @@ fun LibraryScreen(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "No Files Synced Yet",
+                        text = "No Animations Synced Yet",
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
                     )
                     Text(
-                        text = "Tap 'Sync' to read device flash or 'Add Presets' to upload.",
+                        text = "Tap 'Sync' to read device flash or 'GitHub Presets' to upload.",
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f)
                     )
@@ -254,7 +250,7 @@ fun LibraryScreen(
                         value = renameInput,
                         onValueChange = { renameInput = it },
                         singleLine = true,
-                        placeholder = { Text("e.g. alert_ringing") },
+                        placeholder = { Text("e.g. alert_call") },
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(12.dp)
                     )
@@ -280,61 +276,71 @@ fun LibraryScreen(
         )
     }
 
-    // Presets Modal Dialog
+    // Presets Modal Dialog (Loads directly from winpritam/pico-case GitHub repo)
     if (showPresetDialog) {
         AlertDialog(
             onDismissRequest = { showPresetDialog = false },
-            title = { Text("MicroPython File Presets", fontWeight = FontWeight.Bold) },
+            title = { Text("Load GitHub Animation Presets", fontWeight = FontWeight.Bold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Presets formatted for 128x64 SSD1306 (1024 bytes/frame):", fontSize = 11.sp, modifier = Modifier.padding(bottom = 4.dp))
+                    Text(
+                        text = "Downloads directly from winpritam/pico-case/anims and uploads to device:",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(bottom = 4.dp)
+                    )
 
                     PresetChoiceItem(
                         title = "emo_happy.bin",
-                        info = "4,096 bytes (4 frames @ 1024 B/frame) -> anims/",
+                        info = "Happy looping emotion face -> anims/emo_happy.bin",
                         dotColor = Color(0xFF62EFE4)
                     ) {
-                        viewModel.uploadAnimation("emo_happy.bin", generateSampleFrames(4))
+                        viewModel.loadPresetFromGitHub("emo_happy.bin", fallbackFrames = 4)
                         showPresetDialog = false
                     }
 
                     PresetChoiceItem(
                         title = "alert_call.bin",
-                        info = "3,072 bytes (3 frames @ 1024 B/frame) -> anims/",
+                        info = "Incoming call alert animation -> anims/alert_call.bin",
                         dotColor = Color(0xFFFFD166)
                     ) {
-                        viewModel.uploadAnimation("alert_call.bin", generateSampleFrames(3))
+                        viewModel.loadPresetFromGitHub("alert_call.bin", fallbackFrames = 3)
                         showPresetDialog = false
                     }
 
                     PresetChoiceItem(
                         title = "alert_msg.bin",
-                        info = "2,048 bytes (2 frames @ 1024 B/frame) -> anims/",
+                        info = "Incoming message envelope -> anims/alert_msg.bin",
                         dotColor = Color(0xFFB08CFF)
                     ) {
-                        viewModel.uploadAnimation("alert_msg.bin", generateSampleFrames(2))
+                        viewModel.loadPresetFromGitHub("alert_msg.bin", fallbackFrames = 2)
                         showPresetDialog = false
                     }
 
                     PresetChoiceItem(
                         title = "alert_charge.bin",
-                        info = "2,048 bytes (2 frames @ 1024 B/frame) -> anims/",
+                        info = "Battery charging lightning alert -> anims/alert_charge.bin",
                         dotColor = Color(0xFFFF6D80)
                     ) {
-                        viewModel.uploadAnimation("alert_charge.bin", generateSampleFrames(2))
+                        viewModel.loadPresetFromGitHub("alert_charge.bin", fallbackFrames = 2)
                         showPresetDialog = false
                     }
 
                     PresetChoiceItem(
-                        title = "main.py (ESP32 Driver)",
-                        info = "MicroPython OLED listener script -> /main.py",
+                        title = "alert_battery.bin",
+                        info = "Low battery warning alert -> anims/alert_battery.bin",
+                        dotColor = Color(0xFFE91E63)
+                    ) {
+                        viewModel.loadPresetFromGitHub("alert_battery.bin", fallbackFrames = 2)
+                        showPresetDialog = false
+                    }
+
+                    PresetChoiceItem(
+                        title = "alert_missed.bin",
+                        info = "Missed call notification alert -> anims/alert_missed.bin",
                         dotColor = Color(0xFF4CAF50)
                     ) {
-                        val sdaPinNum = sda.toIntOrNull() ?: 21
-                        val sclPinNum = scl.toIntOrNull() ?: 22
-                        val delayMs = delay.toIntOrNull() ?: 120
-                        val py = MicroPythonHelper.generateDeviceCode(sdaPin = sdaPinNum, sclPin = sclPinNum, frameDelayMs = delayMs)
-                        viewModel.uploadAnimation("main.py", py.toByteArray(StandardCharsets.UTF_8))
+                        viewModel.loadPresetFromGitHub("alert_missed.bin", fallbackFrames = 2)
                         showPresetDialog = false
                     }
                 }
@@ -347,26 +353,6 @@ fun LibraryScreen(
             }
         )
     }
-}
-
-// Generate valid 1024-byte frames for 128x64 monochrome OLED
-private fun generateSampleFrames(frameCount: Int): ByteArray {
-    val frameSize = 1024
-    val total = frameSize * frameCount
-    val result = ByteArray(total)
-    for (f in 0 until frameCount) {
-        val offset = f * frameSize
-        for (i in 0 until frameSize) {
-            // Pattern creating smiling eyes / facial contours
-            val row = i / 16
-            val col = i % 16
-            val isBorder = row == 0 || row == 63 || col == 0 || col == 15
-            val isEye = (row in 20..26) && (col in 3..5 || col in 10..12)
-            val isSmile = (row in (42 + f)..46) && (col in 4..11)
-            result[offset + i] = if (isBorder || isEye || isSmile) 0xFF.toByte() else 0x00.toByte()
-        }
-    }
-    return result
 }
 
 @Composable

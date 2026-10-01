@@ -16,9 +16,9 @@ import com.example.data.database.SerialLogEntry
 import com.example.serial.*
 import com.example.serial.driver.UsbSerialProber
 import com.example.service.BackgroundEventService
-import kotlinx.coroutines.Dispatchers
+import com.example.service.sensors.ShakeDetector
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.launch
 import java.nio.charset.StandardCharsets
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -31,6 +31,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val gitHubScriptManager = app.gitHubScriptManager
 
     private val transferManager = FileTransferManager(serialManager)
+
+    // Accelerometer Shake Detector
+    private var shakeDetector: ShakeDetector? = null
+
+    // Random animation cycler job
+    private var randomizerJob: Job? = null
 
     // --- State Stream Binds ---
     val connectionState: StateFlow<ConnectionState> = serialManager.connectionState
@@ -101,47 +107,108 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
 
     init {
+        // Initialize accelerometer shake detector
+        shakeDetector = ShakeDetector(application) {
+            viewModelScope.launch {
+                val enabled = settingsRepository.getBooleanSetting("wake_on_shake_enabled", false)
+                if (enabled) {
+                    serialManager.logSystem("[Motion] Phone shake detected! Waking OLED character...")
+                    serialManager.sendTerminalCommand(PicoProtocol.CMD_EMO_EXCITED)
+                }
+            }
+        }
+
         viewModelScope.launch {
             val bgRun = settingsRepository.getBooleanSetting("run_in_background", true)
             if (bgRun && !BackgroundEventService.isServiceRunning) {
                 startForegroundService()
             }
+
+            // Restore shake detector state
+            if (settingsRepository.getBooleanSetting("wake_on_shake_enabled", false)) {
+                shakeDetector?.start()
+            }
+
+            // Restore randomizer if enabled
+            if (settingsRepository.getBooleanSetting("random_animation_enabled", false)) {
+                startRandomizerLoop()
+            }
         }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        shakeDetector?.stop()
+        randomizerJob?.cancel()
     }
 
     // --- Dashboard Card Toggle Handlers ---
     fun toggleNotification(enabled: Boolean) = viewModelScope.launch {
         settingsRepository.saveBooleanSetting("notification_enabled", enabled)
-        if (enabled) {
-            serialManager.sendTerminalCommand(PicoProtocol.CMD_ALERT_MSG)
-        } else {
-            serialManager.sendTerminalCommand(PicoProtocol.CMD_STOP)
-        }
+        serialManager.logSystem("Notification mirror bridge: ${if (enabled) "ENABLED" else "DISABLED"}")
     }
 
     fun toggleMiniMessage(enabled: Boolean) = viewModelScope.launch {
         settingsRepository.saveBooleanSetting("mini_message_enabled", enabled)
-        serialManager.sendTerminalCommand(if (enabled) "CONFIG_MINI_MSG_ON" else "CONFIG_MINI_MSG_OFF")
     }
 
     fun toggleWakeOnShake(enabled: Boolean) = viewModelScope.launch {
         settingsRepository.saveBooleanSetting("wake_on_shake_enabled", enabled)
-        serialManager.sendTerminalCommand(if (enabled) "CONFIG_SHAKE_ON" else "CONFIG_SHAKE_OFF")
+        if (enabled) {
+            shakeDetector?.start()
+            serialManager.logSystem("Wake-on-shake sensor armed. Shake phone to trigger animation.")
+        } else {
+            shakeDetector?.stop()
+            serialManager.logSystem("Wake-on-shake sensor disabled.")
+        }
     }
 
     fun toggleSleepMode(enabled: Boolean) = viewModelScope.launch {
         settingsRepository.saveBooleanSetting("sleep_mode_enabled", enabled)
-        serialManager.sendTerminalCommand(if (enabled) PicoProtocol.CMD_EMO_SLEEPY else PicoProtocol.CMD_START)
+        if (enabled) {
+            serialManager.logSystem("Sleep mode activated: Putting character to sleep.")
+            serialManager.sendTerminalCommand(PicoProtocol.CMD_EMO_SLEEPY)
+        } else {
+            serialManager.logSystem("Sleep mode deactivated: Waking character.")
+            serialManager.sendTerminalCommand(PicoProtocol.CMD_START)
+        }
     }
 
     fun toggleRandomAnimation(enabled: Boolean) = viewModelScope.launch {
         settingsRepository.saveBooleanSetting("random_animation_enabled", enabled)
-        serialManager.sendTerminalCommand(if (enabled) "CONFIG_RANDOM_ON" else "CONFIG_RANDOM_OFF")
+        if (enabled) {
+            serialManager.logSystem("Randomizer activated: Cycling animations every 10 seconds.")
+            startRandomizerLoop()
+        } else {
+            randomizerJob?.cancel()
+            randomizerJob = null
+            serialManager.logSystem("Randomizer stopped.")
+            serialManager.sendTerminalCommand(PicoProtocol.CMD_START)
+        }
+    }
+
+    private fun startRandomizerLoop() {
+        randomizerJob?.cancel()
+        randomizerJob = viewModelScope.launch {
+            while (isActive) {
+                delay(10000) // 10 second cycle
+                if (!settingsRepository.getBooleanSetting("random_animation_enabled", false)) break
+
+                val files = dao.getAllPicoFiles().filter { it.fileName.endsWith(".bin", ignoreCase = true) }
+                val chosen = if (files.isNotEmpty()) {
+                    files.random().fileName
+                } else {
+                    listOf("anims/emo_happy.bin", "anims/emo_excited.bin", "anims/alert_msg.bin", "anims/alert_charge.bin").random()
+                }
+                val path = if (chosen.startsWith("anims/")) chosen else "anims/$chosen"
+                serialManager.logSystem("[Randomizer] Cycling to $path")
+                serialManager.sendTerminalCommand("PLAY $path")
+            }
+        }
     }
 
     fun toggleAlwaysOn(enabled: Boolean) = viewModelScope.launch {
         settingsRepository.saveBooleanSetting("always_on_enabled", enabled)
-        serialManager.sendTerminalCommand(if (enabled) "CONFIG_ALWAYS_ON" else "CONFIG_ALWAYS_OFF")
     }
 
     // --- General Settings Configurations Changes ---
@@ -250,6 +317,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         transferManager.uploadAnimationFile(fileName, bytes)
     }
 
+    // Load preset file directly from GitHub repository winpritam/pico-case/anims/
+    fun loadPresetFromGitHub(fileName: String, fallbackFrames: Int = 4) = viewModelScope.launch {
+        serialManager.logSystem("Fetching preset '$fileName' from GitHub (winpritam/pico-case)...")
+        val githubBytes = gitHubScriptManager.fetchPresetAnimation(fileName)
+        val finalBytes = if (githubBytes != null && githubBytes.isNotEmpty()) {
+            serialManager.logSystem("Downloaded '$fileName' (${githubBytes.size} B) from GitHub.")
+            githubBytes
+        } else {
+            serialManager.logSystem("GitHub offline/file not in repo: Generating valid $fallbackFrames-frame binary for '$fileName'.")
+            generateSampleFrames(fallbackFrames)
+        }
+        transferManager.uploadAnimationFile(fileName, finalBytes)
+    }
+
     fun playAnimation(fileName: String) = viewModelScope.launch {
         val cleanName = if (fileName.endsWith(".bin", ignoreCase = true) && !fileName.startsWith("anims/")) {
             "anims/$fileName"
@@ -268,7 +349,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val result = serialManager.sendCommand("${PicoProtocol.CMD_DELETE_PREFIX}$targetPath")
         if (result.contains(PicoProtocol.RESP_READY, ignoreCase = true) || result.contains("OK", ignoreCase = true) || result.contains("END", ignoreCase = true)) {
             serialManager.logSystem("Deleted file $targetPath from device storage.")
-            serialManager.sendCommand(PicoProtocol.CMD_LIST_FILES)
+            serialManager.refreshFileList()
         }
     }
 
@@ -281,18 +362,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val result = serialManager.sendCommand("${PicoProtocol.CMD_RENAME_PREFIX}$oldPath $newPath")
         if (result.contains(PicoProtocol.RESP_READY, ignoreCase = true) || result.contains("OK", ignoreCase = true) || result.contains("END", ignoreCase = true)) {
             serialManager.logSystem("Renamed $oldPath to $newPath successfully.")
-            serialManager.sendCommand(PicoProtocol.CMD_LIST_FILES)
+            serialManager.refreshFileList()
         }
     }
 
     fun refreshFileList() = viewModelScope.launch {
-        serialManager.sendCommand(PicoProtocol.CMD_LIST_FILES)
+        serialManager.refreshFileList()
     }
 
     // --- Event Mappings Configurations Updates ---
     fun updateEventMapping(eventKey: String, animationFile: String) = viewModelScope.launch {
-        eventMappingRepository.saveMapping(eventKey, animationFile)
-        serialManager.logSystem("Updated map: $eventKey -> $animationFile")
+        val cleanFile = if (animationFile.isNotBlank() && animationFile.endsWith(".bin", ignoreCase = true) && !animationFile.startsWith("anims/")) {
+            "anims/$animationFile"
+        } else {
+            animationFile
+        }
+        eventMappingRepository.saveMapping(eventKey, cleanFile)
+        serialManager.logSystem("Updated map: $eventKey -> $cleanFile")
     }
 
     // --- Foregrounds Service Start / Stop ---
@@ -336,6 +422,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteAllAnimationsOnDevice() = viewModelScope.launch {
         serialManager.sendCommand("WIPE_STORAGE")
         serialManager.logSystem("Sent master storage format command to microcontroller.")
+        serialManager.refreshFileList()
     }
 
     fun scanUsbHardware() {
@@ -348,6 +435,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearUploadState() {
         transferManager.resetState()
+    }
+
+    // Helper to generate valid 1024-byte per frame animation binaries (128x64 SSD1306)
+    fun generateSampleFrames(frameCount: Int): ByteArray {
+        val frameSize = 1024
+        val total = frameSize * frameCount
+        val result = ByteArray(total)
+        for (f in 0 until frameCount) {
+            val offset = f * frameSize
+            for (i in 0 until frameSize) {
+                val row = i / 16
+                val col = i % 16
+                val isBorder = row == 0 || row == 63 || col == 0 || col == 15
+                val isEye = (row in 20..26) && (col in 3..5 || col in 10..12)
+                val isSmile = (row in (42 + f)..46) && (col in 4..11)
+                result[offset + i] = if (isBorder || isEye || isSmile) 0xFF.toByte() else 0x00.toByte()
+            }
+        }
+        return result
     }
 
     class Factory(private val application: Application) : ViewModelProvider.Factory {

@@ -33,6 +33,9 @@ interface PicocaseDao {
     @Query("SELECT * FROM pico_files ORDER BY fileName ASC")
     fun getAllPicoFilesFlow(): Flow<List<PicoFile>>
 
+    @Query("SELECT * FROM pico_files ORDER BY fileName ASC")
+    suspend fun getAllPicoFiles(): List<PicoFile>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertPicoFiles(files: List<PicoFile>)
 

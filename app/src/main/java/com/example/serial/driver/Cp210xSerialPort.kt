@@ -10,17 +10,16 @@ import android.util.Log
 class Cp210xSerialPort(
     override val device: UsbDevice,
     override val portNumber: Int = 0,
-    override val deviceDescription: String = "ESP32 DevKit (CP210x USB-to-UART)"
+    override val deviceDescription: String = "ESP32 DevKit (CP210x)"
 ) : UsbSerialPort {
 
-    override val driverName: String = "CP210x"
     private val tag = "Cp210xSerialPort"
+    override val driverName: String = "Silicon Labs CP210x"
 
     private var connection: UsbDeviceConnection? = null
     private var usbInterface: UsbInterface? = null
     private var endpointIn: UsbEndpoint? = null
     private var endpointOut: UsbEndpoint? = null
-
     private var currentBaudRate = 115200
 
     companion object {
@@ -32,6 +31,8 @@ class Cp210xSerialPort(
         private const val CP210X_SET_BAUDRATE = 0x1E
 
         private const val UART_ENABLE = 0x0001
+        private const val UART_DISABLE = 0x0000
+
         private const val CONTROL_DTR = 0x0101
         private const val CONTROL_RTS = 0x0202
     }
@@ -39,39 +40,45 @@ class Cp210xSerialPort(
     override fun open(connection: UsbDeviceConnection): Boolean {
         this.connection = connection
 
-        val ifaceIndex = portNumber.coerceIn(0, (device.interfaceCount - 1).coerceAtLeast(0))
-        val iface = device.getInterface(ifaceIndex)
-
-        if (!connection.claimInterface(iface, true)) {
-            Log.e(tag, "Failed to claim CP210x interface $ifaceIndex")
-            return false
-        }
-
+        var chosenIface: UsbInterface? = null
         var inEp: UsbEndpoint? = null
         var outEp: UsbEndpoint? = null
 
-        for (i in 0 until iface.endpointCount) {
-            val ep = iface.getEndpoint(i)
-            if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                if (ep.direction == UsbConstants.USB_DIR_IN && inEp == null) {
-                    inEp = ep
-                } else if (ep.direction == UsbConstants.USB_DIR_OUT && outEp == null) {
-                    outEp = ep
+        // Scan all interfaces to locate the one with bulk IN and OUT endpoints
+        for (idx in 0 until device.interfaceCount) {
+            val candidate = device.getInterface(idx)
+            var candidateIn: UsbEndpoint? = null
+            var candidateOut: UsbEndpoint? = null
+            for (i in 0 until candidate.endpointCount) {
+                val ep = candidate.getEndpoint(i)
+                if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                    if (ep.direction == UsbConstants.USB_DIR_IN && candidateIn == null) {
+                        candidateIn = ep
+                    } else if (ep.direction == UsbConstants.USB_DIR_OUT && candidateOut == null) {
+                        candidateOut = ep
+                    }
+                }
+            }
+            if (candidateIn != null && candidateOut != null) {
+                if (connection.claimInterface(candidate, true)) {
+                    chosenIface = candidate
+                    inEp = candidateIn
+                    outEp = candidateOut
+                    break
                 }
             }
         }
 
-        if (inEp == null || outEp == null) {
-            Log.e(tag, "Could not find Bulk IN/OUT endpoints for CP210x")
-            connection.releaseInterface(iface)
+        if (chosenIface == null || inEp == null || outEp == null) {
+            Log.e(tag, "Could not claim interface with Bulk IN/OUT endpoints for CP210x on ${device.deviceName}")
             return false
         }
 
-        this.usbInterface = iface
+        this.usbInterface = chosenIface
         this.endpointIn = inEp
         this.endpointOut = outEp
 
-        val ifaceNum = iface.id
+        val ifaceNum = chosenIface.id
 
         // 1. Enable UART
         connection.controlTransfer(REQTYPE_HOST_TO_INTERFACE, CP210X_IFC_ENABLE, UART_ENABLE, ifaceNum, null, 0, 1000)
@@ -106,21 +113,11 @@ class Cp210xSerialPort(
             ret = conn.controlTransfer(REQTYPE_HOST_TO_INTERFACE, CP210X_SET_BAUDDIV, divisor, ifaceNum, null, 0, 1000)
         }
 
-        // Set Line Control: 8 Data bits, 1 stop bit, no parity (0x0800)
-        val lineCtl = when (dataBits) {
-            5 -> 0x0500
-            6 -> 0x0600
-            7 -> 0x0700
-            else -> 0x0800
-        } or when (stopBits) {
-            2 -> 0x0002
-            else -> 0x0000
-        } or when (parity) {
-            1 -> 0x0010 // ODD
-            2 -> 0x0020 // EVEN
-            else -> 0x0000 // NONE
-        }
-        conn.controlTransfer(REQTYPE_HOST_TO_INTERFACE, CP210X_SET_LINE_CTL, lineCtl, ifaceNum, null, 0, 1000)
+        // Configure DataBits, StopBits, Parity (default 8N1 -> 0x0800)
+        var lineControl = (dataBits and 0x0F) shl 8
+        lineControl = lineControl or (parity and 0x0F) shl 4
+        lineControl = lineControl or (stopBits and 0x0F)
+        conn.controlTransfer(REQTYPE_HOST_TO_INTERFACE, CP210X_SET_LINE_CTL, lineControl, ifaceNum, null, 0, 1000)
 
         return ret >= 0
     }
@@ -151,12 +148,15 @@ class Cp210xSerialPort(
     }
 
     override fun close() {
-        try {
-            connection?.let { conn ->
-                usbInterface?.let { conn.releaseInterface(it) }
+        val conn = connection
+        val iface = usbInterface
+        if (conn != null && iface != null) {
+            try {
+                conn.controlTransfer(REQTYPE_HOST_TO_INTERFACE, CP210X_IFC_ENABLE, UART_DISABLE, iface.id, null, 0, 500)
+                conn.releaseInterface(iface)
+            } catch (e: Exception) {
+                Log.e(tag, "Error closing CP210x interface: ${e.message}")
             }
-        } catch (e: Exception) {
-            Log.e(tag, "Error closing CP210x port: ${e.message}")
         }
         connection = null
         usbInterface = null

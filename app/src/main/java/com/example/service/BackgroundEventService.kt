@@ -293,17 +293,20 @@ class BackgroundEventService : Service() {
             val animationFile = eventMappingRepository.getMappingForEvent(eventKey) ?: ""
             logToTerminal("System Trigger >> $logLabel ($eventKey). Mapping file: $animationFile")
 
-            if (animationFile.isNotEmpty()) {
-                // Command protocol sends either raw ALERT or filename map triggers
-                val fileCmd = when (eventKey) {
-                    PicoProtocol.EVENT_CHARGING_STARTED -> PicoProtocol.CMD_ALERT_CHARGE
-                    PicoProtocol.EVENT_BATTERY_LOW -> "ALERT_BATTERY"
-                    PicoProtocol.EVENT_INCOMING_SMS -> PicoProtocol.CMD_ALERT_MSG
-                    PicoProtocol.EVENT_INCOMING_CALL -> PicoProtocol.CMD_ALERT_CALL
-                    else -> "ALERT_EVENT $animationFile"
+            if (animationFile.isNotBlank()) {
+                val cleanPath = if (animationFile.startsWith("anims/")) animationFile else "anims/$animationFile"
+                val fileCmd = when {
+                    cleanPath.endsWith("alert_charge.bin", ignoreCase = true) -> PicoProtocol.CMD_ALERT_CHARGE
+                    cleanPath.endsWith("alert_battery.bin", ignoreCase = true) -> "ALERT_BATTERY"
+                    cleanPath.endsWith("alert_call.bin", ignoreCase = true) -> PicoProtocol.CMD_ALERT_CALL
+                    cleanPath.endsWith("alert_msg.bin", ignoreCase = true) -> PicoProtocol.CMD_ALERT_MSG
+                    cleanPath.endsWith("emo_happy.bin", ignoreCase = true) -> PicoProtocol.CMD_EMO_HAPPY
+                    cleanPath.endsWith("emo_sleepy.bin", ignoreCase = true) -> PicoProtocol.CMD_EMO_SLEEPY
+                    cleanPath.endsWith("emo_excited.bin", ignoreCase = true) -> PicoProtocol.CMD_EMO_EXCITED
+                    else -> "ALERT_EVENT $cleanPath"
                 }
 
-                serialManager.sendCommand(fileCmd)
+                serialManager.sendTerminalCommand(fileCmd)
             }
         }
     }
@@ -318,14 +321,19 @@ class BackgroundEventService : Service() {
             val priorityContact = settingsRepository.getSetting("priority_contact", "").trim()
             if (priorityContact.isNotEmpty() && phoneNumber.contains(priorityContact, ignoreCase = true)) {
                 logToTerminal("Priority Contact Call ($priorityContact)! Triggering: ALERT_SPECIAL")
-                serialManager.sendCommand("ALERT_SPECIAL")
+                serialManager.sendTerminalCommand("ALERT_SPECIAL")
                 return@launch
             }
 
-            // Normal Call Flow
-            val file = eventMappingRepository.getMappingForEvent(PicoProtocol.EVENT_INCOMING_CALL) ?: "alert_call.bin"
-            logToTerminal("Call Trigger from $phoneNumber. File mapping: $file")
-            serialManager.sendCommand(PicoProtocol.CMD_ALERT_CALL)
+            // Respect Custom Mapped Call File
+            val file = eventMappingRepository.getMappingForEvent(PicoProtocol.EVENT_INCOMING_CALL) ?: "anims/alert_call.bin"
+            val cleanPath = if (file.startsWith("anims/")) file else "anims/$file"
+            logToTerminal("Call Trigger from $phoneNumber. File mapping: $cleanPath")
+            if (cleanPath.endsWith("alert_call.bin", ignoreCase = true)) {
+                serialManager.sendTerminalCommand(PicoProtocol.CMD_ALERT_CALL)
+            } else {
+                serialManager.sendTerminalCommand("ALERT_EVENT $cleanPath")
+            }
         }
     }
 
@@ -337,13 +345,19 @@ class BackgroundEventService : Service() {
             val priorityContact = settingsRepository.getSetting("priority_contact", "").trim()
             if (priorityContact.isNotEmpty() && sender.contains(priorityContact, ignoreCase = true)) {
                 logToTerminal("Priority Contact SMS ($priorityContact)! Triggering: ALERT_SPECIAL")
-                serialManager.sendCommand("ALERT_SPECIAL")
+                serialManager.sendTerminalCommand("ALERT_SPECIAL")
                 return@launch
             }
 
-            val file = eventMappingRepository.getMappingForEvent(PicoProtocol.EVENT_INCOMING_SMS) ?: "alert_msg.bin"
-            logToTerminal("SMS received from $sender. File mapping: $file")
-            serialManager.sendCommand(PicoProtocol.CMD_ALERT_MSG)
+            // Respect Custom Mapped SMS File
+            val file = eventMappingRepository.getMappingForEvent(PicoProtocol.EVENT_INCOMING_SMS) ?: "anims/alert_msg.bin"
+            val cleanPath = if (file.startsWith("anims/")) file else "anims/$file"
+            logToTerminal("SMS received from $sender. File mapping: $cleanPath")
+            if (cleanPath.endsWith("alert_msg.bin", ignoreCase = true)) {
+                serialManager.sendTerminalCommand(PicoProtocol.CMD_ALERT_MSG)
+            } else {
+                serialManager.sendTerminalCommand("ALERT_EVENT $cleanPath")
+            }
         }
     }
 

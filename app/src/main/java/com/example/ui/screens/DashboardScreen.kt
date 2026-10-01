@@ -154,7 +154,7 @@ fun DashboardScreen(
         val cards = listOf(
             BehaviorCardData(
                 title = "Notifications",
-                desc = "Mirror SMS / Call to OLED",
+                desc = if (notifications) "Forwarding SMS, WhatsApp & Calls" else "Notification bridge paused",
                 icon = Icons.Default.Notifications,
                 checked = notifications,
                 containerColor = MaterialTheme.colorScheme.primaryContainer,
@@ -163,7 +163,7 @@ fun DashboardScreen(
             ),
             BehaviorCardData(
                 title = "Sleep Mode",
-                desc = "Dim OLED character cells",
+                desc = if (sleepMode) "Character sleeping (EMO_SLEEPY)" else "Character awake & active",
                 icon = Icons.Default.Bedtime,
                 checked = sleepMode,
                 containerColor = MaterialTheme.colorScheme.secondaryContainer,
@@ -172,8 +172,8 @@ fun DashboardScreen(
             ),
             BehaviorCardData(
                 title = "Wake on Shake",
-                desc = "Trigger gesture animations",
-                icon = Icons.Default.Fingerprint,
+                desc = if (wakeShake) "Armed: Shake phone to wake!" else "Sensor motion wake paused",
+                icon = Icons.Default.Vibration,
                 checked = wakeShake,
                 containerColor = MaterialTheme.colorScheme.primaryContainer,
                 iconColor = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -181,7 +181,7 @@ fun DashboardScreen(
             ),
             BehaviorCardData(
                 title = "Randomize",
-                desc = "Cycle anims/ loop in bg",
+                desc = if (randomAnim) "Cycling anims/ every 10s" else "Manual animation loop",
                 icon = Icons.Default.Shuffle,
                 checked = randomAnim,
                 containerColor = MaterialTheme.colorScheme.secondaryContainer,

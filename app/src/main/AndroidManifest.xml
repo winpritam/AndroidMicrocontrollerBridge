@@ -45,7 +45,7 @@
 
         <!-- Notification Listener Service binding -->
         <service
-            android:name=".service.monitors.NotificationMonitor"
+            android:name=".service.PicocaseNotificationListenerService"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
             android:exported="true">
             <intent-filter>

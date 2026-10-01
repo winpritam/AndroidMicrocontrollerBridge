@@ -13,8 +13,7 @@ import android.util.Log
 import com.example.data.database.PicoFile
 import com.example.data.database.PicocaseDao
 import com.example.data.database.SerialLogEntry
-import com.example.serial.driver.UsbSerialPort
-import com.example.serial.driver.UsbSerialProber
+import com.example.serial.driver.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
@@ -53,7 +52,8 @@ class SerialManager(
     private val _isSimulationMode = MutableStateFlow(false)
     val isSimulationMode: StateFlow<Boolean> = _isSimulationMode.asStateFlow()
 
-    private val incomingLinesFlow = MutableSharedFlow<String>(replay = 0, extraBufferCapacity = 128)
+    // Shared flow with replay=1 so fast responses aren't lost by immediate collectors
+    private val incomingLinesFlow = MutableSharedFlow<String>(replay = 1, extraBufferCapacity = 128)
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var readJob: Job? = null
@@ -128,7 +128,10 @@ class SerialManager(
         scope.launch {
             val savedBaud = dao.getSettingByKey("baud_rate")?.value?.toIntOrNull() ?: 115200
             currentBaudRate = savedBaud
-            scanAndConnect()
+            val autoConnect = dao.getSettingByKey("auto_connect")?.value != "false"
+            if (autoConnect) {
+                scanAndConnect()
+            }
         }
     }
 
@@ -209,15 +212,29 @@ class SerialManager(
         try {
             val connection = usbManager.openDevice(device)
             if (connection == null) {
-                logSystem("Failed to open USB connection.")
+                logSystem("Failed to open USB device handle. Check OTG cable or grant permission.")
                 _connectionState.value = ConnectionState.ERROR
                 return
             }
 
-            val port = UsbSerialProber.createPort(device)
-            val opened = port.open(connection)
-            if (!opened) {
-                logSystem("Failed to initialize driver ${port.driverName} for ${port.deviceDescription}")
+            // Robust multi-driver trial: try primary chip driver, then CDC-ACM, then GenericBulk
+            val primaryPort = UsbSerialProber.createPort(device)
+            val driverCandidates = listOf(
+                primaryPort,
+                CdcAcmSerialPort(device, 0, "CDC-ACM Serial"),
+                GenericBulkSerialPort(device, 0, "Generic USB Bulk")
+            ).distinctBy { it.driverName }
+
+            var successfullyOpenedPort: UsbSerialPort? = null
+            for (candidate in driverCandidates) {
+                if (candidate.open(connection)) {
+                    successfullyOpenedPort = candidate
+                    break
+                }
+            }
+
+            if (successfullyOpenedPort == null) {
+                logSystem("Could not initialize any serial driver for ${device.deviceName}")
                 connection.close()
                 _connectionState.value = ConnectionState.ERROR
                 return
@@ -226,22 +243,25 @@ class SerialManager(
             val baudStr = runBlocking { dao.getSettingByKey("baud_rate")?.value } ?: "115200"
             val baud = baudStr.toIntOrNull() ?: 115200
             currentBaudRate = baud
-            port.setParameters(baudRate = baud)
-            // ESP32: Deassert DTR and RTS so auto-reset circuit lets the ESP32 run freely
-            port.setDtrRts(dtr = false, rts = false)
+            successfullyOpenedPort.setParameters(baudRate = baud)
+            // Keep DTR and RTS deasserted so ESP32 runs freely without auto-reset
+            successfullyOpenedPort.setDtrRts(dtr = false, rts = false)
 
             this.usbConnection = connection
-            this.activePort = port
+            this.activePort = successfullyOpenedPort
             this.usbDevice = device
 
             _connectionState.value = ConnectionState.CONNECTED
-            _connectedDeviceInfo.value = "${port.deviceDescription} @ ${baud}bps"
-            logSystem("Hardware Link Established: ${port.deviceDescription} @ $baud baud")
+            _connectedDeviceInfo.value = "${successfullyOpenedPort.deviceDescription} @ ${baud}bps"
+            logSystem("Hardware Link Established: ${successfullyOpenedPort.deviceDescription} @ $baud baud")
 
             startReadingFromDevice()
 
-            // NOTE: Do NOT send LIST_FILES automatically or auto-deploy main.py on connect.
-            // Let the device run normally without blocking terminal!
+            // Gracefully query files from anims/ directory in background without blocking
+            scope.launch {
+                delay(600)
+                refreshFileList()
+            }
         } catch (e: Exception) {
             logSystem("Connection error: ${e.message}")
             _connectionState.value = ConnectionState.ERROR
@@ -270,6 +290,7 @@ class SerialManager(
                                 if (line.isNotEmpty()) {
                                     logRx(line)
                                     incomingLinesFlow.emit(line)
+                                    checkAndAutoParseFileLine(line)
                                 }
                                 lineBuffer.reset()
                             }
@@ -278,17 +299,32 @@ class SerialManager(
                         }
                     }
                 } else {
-                    // Flush lineBuffer if > 120ms passed without newline (shows prompt '>>> ' or partial output)
-                    if (lineBuffer.size() > 0 && (now - lastByteTime > 120)) {
+                    // Flush lineBuffer if > 100ms passed without newline (shows prompt '>>> ' or partial output)
+                    if (lineBuffer.size() > 0 && (now - lastByteTime > 100)) {
                         val partial = lineBuffer.toString("UTF-8").trim()
                         if (partial.isNotEmpty()) {
                             logRx(partial)
                             incomingLinesFlow.emit(partial)
+                            checkAndAutoParseFileLine(partial)
                         }
                         lineBuffer.reset()
                     }
                 }
                 delay(10)
+            }
+        }
+    }
+
+    // Auto-parses any file listing stream coming from the ESP32
+    private fun checkAndAutoParseFileLine(line: String) {
+        val trimmed = line.trim()
+        if (trimmed.isEmpty() || trimmed == PicoProtocol.RESP_END || trimmed == PicoProtocol.RESP_READY || trimmed.startsWith("ERROR")) return
+        val parts = trimmed.split(" ")
+        if (parts.isNotEmpty() && parts[0].endsWith(".bin", ignoreCase = true)) {
+            val name = parts[0]
+            val size = if (parts.size >= 2) parts[1].toLongOrNull() ?: 0L else 0L
+            scope.launch {
+                dao.insertPicoFiles(listOf(PicoFile(name, size, "emo")))
             }
         }
     }
@@ -310,30 +346,54 @@ class SerialManager(
         logSystem("USB Serial disconnected.")
     }
 
-    private class ResponseReceivedException : Exception()
+    // Request file list from microcontroller's anims/ directory
+    suspend fun refreshFileList(): List<PicoFile> = withContext(Dispatchers.IO) {
+        val port = activePort
+        if (port == null) {
+            logSystem("Cannot sync files: Microcontroller offline.")
+            return@withContext emptyList()
+        }
 
-    private fun parseFileListResponse(responseStr: String) {
-        val lines = responseStr.lines()
-        val parsedFiles = mutableListOf<PicoFile>()
-        for (line in lines) {
-            val trimmed = line.trim()
-            if (trimmed.isEmpty() || trimmed == PicoProtocol.RESP_END || trimmed == PicoProtocol.RESP_READY || trimmed == PicoProtocol.RESP_ERROR) {
-                continue
-            }
-            val parts = trimmed.split(" ")
-            if (parts.isNotEmpty()) {
-                val name = parts[0]
-                val size = if (parts.size >= 2) parts[1].toLongOrNull() ?: 0L else 0L
-                val type = if (name.endsWith(".bin", ignoreCase = true)) "emo" else "script"
-                parsedFiles.add(PicoFile(name, size, type))
+        logSystem("Syncing files from microcontroller (anims/)...")
+        val receivedFiles = mutableListOf<PicoFile>()
+        var isCompleted = false
+
+        // Listen for incoming lines BEFORE sending the command so no lines are dropped
+        val collectorJob = scope.launch {
+            incomingLinesFlow.collect { line ->
+                val trimmed = line.trim()
+                if (trimmed == PicoProtocol.RESP_END || trimmed.startsWith("ERROR")) {
+                    isCompleted = true
+                    cancel()
+                    return@collect
+                }
+                val parts = trimmed.split(" ")
+                if (parts.isNotEmpty() && parts[0].endsWith(".bin", ignoreCase = true)) {
+                    val name = parts[0]
+                    val size = if (parts.size >= 2) parts[1].toLongOrNull() ?: 0L else 0L
+                    receivedFiles.add(PicoFile(name, size, "emo"))
+                }
             }
         }
-        if (parsedFiles.isNotEmpty()) {
-            scope.launch {
-                dao.clearPicoFiles()
-                dao.insertPicoFiles(parsedFiles)
+
+        delay(30)
+        logTx(PicoProtocol.CMD_LIST_FILES)
+        val cmdBytes = (PicoProtocol.CMD_LIST_FILES + "\r\n").toByteArray(StandardCharsets.UTF_8)
+        port.write(cmdBytes, 1000)
+
+        withTimeoutOrNull(3000) {
+            while (!isCompleted) {
+                delay(40)
             }
         }
+        collectorJob.cancel()
+
+        logSystem("Directory sync complete: ${receivedFiles.size} animation file(s) found in anims/.")
+        dao.clearPicoFiles()
+        if (receivedFiles.isNotEmpty()) {
+            dao.insertPicoFiles(receivedFiles)
+        }
+        return@withContext receivedFiles
     }
 
     suspend fun writeRawBytes(data: ByteArray, timeoutMs: Int = 1000): Int = withContext(Dispatchers.IO) {
@@ -341,11 +401,11 @@ class SerialManager(
         port.write(data, timeoutMs)
     }
 
-    // Direct, non-blocking send for terminal commands typed by the user
+    // Direct, non-blocking send for terminal commands typed by the user or triggered by events
     fun sendTerminalCommand(command: String) {
         val port = activePort
         if (port == null) {
-            logSystem("Terminal: Device is not connected.")
+            logSystem("Device offline. Command ignored: $command")
             return
         }
         logTx(command)
@@ -355,8 +415,8 @@ class SerialManager(
         }
     }
 
-    // Command sender for structured requests
-    suspend fun sendCommand(command: String, timeoutMs: Long = 2000, maxRetries: Int = 0): String = withContext(Dispatchers.IO) {
+    // Command sender for structured requests with pre-subscribed collector
+    suspend fun sendCommand(command: String, timeoutMs: Long = 2500): String = withContext(Dispatchers.IO) {
         commandMutex.lock()
         var response = ""
 
@@ -370,43 +430,44 @@ class SerialManager(
                 return@withContext "ERROR: OFFLINE"
             }
 
-            val commandBytes = (command + "\r\n").toByteArray(StandardCharsets.UTF_8)
-            val sent = port.write(commandBytes, 1000)
+            val resultList = mutableListOf<String>()
+            var isDone = false
 
-            if (sent >= 0) {
-                val resultList = mutableListOf<String>()
-
-                withTimeoutOrNull(timeoutMs) {
-                    try {
-                        incomingLinesFlow.collect { line ->
-                            resultList.add(line)
-                            if (command == PicoProtocol.CMD_LIST_FILES) {
-                                if (line.contains(PicoProtocol.RESP_END) || line.contains(PicoProtocol.RESP_ERROR)) {
-                                    throw ResponseReceivedException()
-                                }
-                            } else {
-                                if (line.contains(PicoProtocol.RESP_READY) ||
-                                    line.contains(PicoProtocol.RESP_END) ||
-                                    line.contains(PicoProtocol.RESP_ERROR) ||
-                                    resultList.size >= 1
-                                ) {
-                                    throw ResponseReceivedException()
-                                }
-                            }
-                        }
-                    } catch (e: ResponseReceivedException) {
-                        // Expected break
-                    }
-                }
-
-                if (resultList.isNotEmpty()) {
-                    response = resultList.joinToString("\n")
+            // Pre-subscribe collector before writing to USB
+            val collectJob = scope.launch {
+                incomingLinesFlow.collect { line ->
+                    resultList.add(line)
+                    val trimmed = line.trim()
                     if (command == PicoProtocol.CMD_LIST_FILES) {
-                        parseFileListResponse(response)
+                        if (trimmed == PicoProtocol.RESP_END || trimmed.startsWith("ERROR")) {
+                            isDone = true
+                            cancel()
+                        }
+                    } else {
+                        if (trimmed == PicoProtocol.RESP_READY ||
+                            trimmed == PicoProtocol.RESP_END ||
+                            trimmed.startsWith("ERROR") ||
+                            resultList.size >= 1
+                        ) {
+                            isDone = true
+                            cancel()
+                        }
                     }
                 }
             }
 
+            delay(20)
+            val commandBytes = (command + "\r\n").toByteArray(StandardCharsets.UTF_8)
+            port.write(commandBytes, 1000)
+
+            withTimeoutOrNull(timeoutMs) {
+                while (!isDone) {
+                    delay(30)
+                }
+            }
+            collectJob.cancel()
+
+            response = resultList.joinToString("\n")
             return@withContext response
         } finally {
             _connectionState.value = ConnectionState.CONNECTED

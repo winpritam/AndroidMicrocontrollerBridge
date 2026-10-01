@@ -87,8 +87,8 @@ class CdcAcmSerialPort(
 
         // Initialize line coding (default 115200 8N1)
         setParameters(currentBaudRate)
-        // Set DTR = 1, RTS = 1
-        setDtrRts(true, true)
+        // Set DTR = 0, RTS = 0
+        setDtrRts(false, false)
 
         Log.i(tag, "CdcAcmSerialPort opened successfully for ${device.deviceName}")
         return true

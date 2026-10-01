@@ -16,9 +16,8 @@ class GitHubScriptManager(
     private val settingsRepository: SettingsRepository
 ) {
     private val tag = "GitHubScriptManager"
-    private val repoUrl = "https://github.com/winpritam/pico-case"
-    private val rawUrlMain = "https://raw.githubusercontent.com/winpritam/pico-case/main/main.py"
-    private val rawUrlMaster = "https://raw.githubusercontent.com/winpritam/pico-case/master/main.py"
+    private val repoBaseMain = "https://raw.githubusercontent.com/winpritam/pico-case/main"
+    private val repoBaseMaster = "https://raw.githubusercontent.com/winpritam/pico-case/master"
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -53,7 +52,7 @@ class GitHubScriptManager(
         // Try 'main' branch first
         try {
             val req = Request.Builder()
-                .url(rawUrlMain)
+                .url("$repoBaseMain/main.py")
                 .header("User-Agent", "Picocase-Android-Companion")
                 .build()
             client.newCall(req).execute().use { resp ->
@@ -62,14 +61,14 @@ class GitHubScriptManager(
                 }
             }
         } catch (e: Exception) {
-            Log.w(tag, "Failed to fetch from 'main': ${e.message}")
+            Log.w(tag, "Failed to fetch main.py from 'main': ${e.message}")
         }
 
         // If 'main' branch didn't work, try 'master' branch
         if (downloadedCode == null) {
             try {
                 val req = Request.Builder()
-                    .url(rawUrlMaster)
+                    .url("$repoBaseMaster/main.py")
                     .header("User-Agent", "Picocase-Android-Companion")
                     .build()
                 client.newCall(req).execute().use { resp ->
@@ -78,7 +77,7 @@ class GitHubScriptManager(
                     }
                 }
             } catch (e: Exception) {
-                Log.w(tag, "Failed to fetch from 'master': ${e.message}")
+                Log.w(tag, "Failed to fetch main.py from 'master': ${e.message}")
             }
         }
 
@@ -100,5 +99,50 @@ class GitHubScriptManager(
             }
             return@withContext false
         }
+    }
+
+    // Fetches preset .bin animation file from GitHub repo winpritam/pico-case/anims/<fileName>
+    suspend fun fetchPresetAnimation(fileName: String): ByteArray? = withContext(Dispatchers.IO) {
+        val cleanName = if (fileName.startsWith("anims/")) fileName.substringAfter("anims/") else fileName
+
+        // 1. Try 'main' branch
+        try {
+            val req = Request.Builder()
+                .url("$repoBaseMain/anims/$cleanName")
+                .header("User-Agent", "Picocase-Android-Companion")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val bytes = resp.body?.bytes()
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        Log.i(tag, "Fetched $cleanName (${bytes.size} B) from GitHub main branch")
+                        return@withContext bytes
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to fetch $cleanName from GitHub main: ${e.message}")
+        }
+
+        // 2. Try 'master' branch
+        try {
+            val req = Request.Builder()
+                .url("$repoBaseMaster/anims/$cleanName")
+                .header("User-Agent", "Picocase-Android-Companion")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val bytes = resp.body?.bytes()
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        Log.i(tag, "Fetched $cleanName (${bytes.size} B) from GitHub master branch")
+                        return@withContext bytes
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to fetch $cleanName from GitHub master: ${e.message}")
+        }
+
+        return@withContext null
     }
 }

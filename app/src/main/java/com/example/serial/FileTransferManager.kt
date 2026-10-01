@@ -34,14 +34,23 @@ class FileTransferManager(private val serialManager: SerialManager) {
             return@withContext
         }
 
-        val fileSizeBytes = bytes.size.toLong()
+        // ESP32 requires frames to be exact multiples of 1024 bytes (128*64/8)
+        val uploadBytes = if (extension == "bin" && bytes.size % 1024 != 0) {
+            val remainder = bytes.size % 1024
+            val padding = 1024 - remainder
+            bytes + ByteArray(padding)
+        } else {
+            bytes
+        }
+
+        val fileSizeBytes = uploadBytes.size.toLong()
         val maxUploadSize = 512 * 1024 // 512 KB
         if (fileSizeBytes > maxUploadSize) {
             _transferState.value = TransferState.Failed("File limit exceeded: Maximum size is 512 KB.")
             return@withContext
         }
 
-        _transferState.value = TransferState.Validating("Handshaking with MicroPython / ESP32 device...")
+        _transferState.value = TransferState.Validating("Preparing upload to ESP32 / MicroPython flash...")
 
         try {
             // Target path: .bin files MUST be placed in 'anims/' directory
@@ -55,94 +64,59 @@ class FileTransferManager(private val serialManager: SerialManager) {
             val initResp = serialManager.sendCommand("FILE_UPLOAD_BEGIN $destPath $fileSizeBytes", timeoutMs = 4000)
             val isProtocolReady = initResp.contains("READY", ignoreCase = true) || initResp.contains("OK", ignoreCase = true)
 
+            if (!isProtocolReady) {
+                _transferState.value = TransferState.Failed("Microcontroller rejected upload initiation: $initResp")
+                return@withContext
+            }
+
             val chunkSize = 512
-            val totalBytes = bytes.size
+            val totalBytes = uploadBytes.size
             var offset = 0
             val startTime = System.currentTimeMillis()
 
-            if (isProtocolReady) {
-                // Use Picocase Stream Protocol
-                while (offset < totalBytes) {
-                    val currentChunkSize = minOf(chunkSize, totalBytes - offset)
-                    val chunkBytes = bytes.copyOfRange(offset, offset + currentChunkSize)
+            // 2. Stream DATA:<hex> chunks
+            while (offset < totalBytes) {
+                val currentChunkSize = minOf(chunkSize, totalBytes - offset)
+                val chunkBytes = uploadBytes.copyOfRange(offset, offset + currentChunkSize)
 
-                    val hexStringBuilder = StringBuilder()
-                    for (b in chunkBytes) {
-                        hexStringBuilder.append(String.format("%02X", b))
-                    }
-                    val hexChunk = "DATA:${hexStringBuilder}"
+                val hexStringBuilder = StringBuilder()
+                for (b in chunkBytes) {
+                    hexStringBuilder.append(String.format("%02X", b))
+                }
+                val hexChunk = "DATA:${hexStringBuilder}"
 
-                    val chunkResp = serialManager.sendCommand(hexChunk, timeoutMs = 3000, maxRetries = 2)
-                    if (chunkResp.contains("ERROR", ignoreCase = true)) {
-                        _transferState.value = TransferState.Failed("Device reported error on chunk write: $chunkResp")
-                        return@withContext
-                    }
-
-                    offset += currentChunkSize
-                    val progressRatio = offset.toFloat() / totalBytes
-                    val elapsedSeconds = (System.currentTimeMillis() - startTime) / 1000f + 0.1f
-                    val speed = (offset / 1024f) / elapsedSeconds
-
-                    _transferState.value = TransferState.Transferring(
-                        fileName = destPath,
-                        progress = progressRatio,
-                        uploadedBytes = offset.toLong(),
-                        totalBytes = totalBytes.toLong(),
-                        remainingBytes = (totalBytes - offset).toLong(),
-                        speedKbps = speed
-                    )
+                val chunkResp = serialManager.sendCommand(hexChunk, timeoutMs = 3000)
+                if (chunkResp.contains("ERROR", ignoreCase = true)) {
+                    _transferState.value = TransferState.Failed("Device reported error on chunk write: $chunkResp")
+                    return@withContext
                 }
 
-                // Finalize session
-                val finalizeResp = serialManager.sendCommand("FILE_UPLOAD_END", timeoutMs = 3000)
-                if (finalizeResp.contains("READY", ignoreCase = true) || finalizeResp.contains("OK", ignoreCase = true) || finalizeResp.contains("END", ignoreCase = true)) {
-                    _transferState.value = TransferState.Success(destPath)
-                    serialManager.sendCommand(PicoProtocol.CMD_LIST_FILES)
-                } else {
-                    _transferState.value = TransferState.Failed("Failed to finalize upload: $finalizeResp")
-                }
-            } else {
-                // Direct MicroPython REPL fallback transfer
-                serialManager.logSystem("Picocase daemon not active. Attempting MicroPython REPL file write...")
-                _transferState.value = TransferState.Validating("Writing via MicroPython filesystem...")
+                offset += currentChunkSize
+                val progress = offset.toFloat() / totalBytes
+                val elapsedSec = (System.currentTimeMillis() - startTime) / 1000f
+                val speed = if (elapsedSec > 0) (offset / 1024f) / elapsedSec else 0f
 
-                // Ensure anims folder exists on device
-                if (destPath.startsWith("anims/")) {
-                    serialManager.sendCommand("import os; try:\n    os.mkdir('anims')\nexcept:\n    pass", timeoutMs = 1500)
-                }
+                _transferState.value = TransferState.Transferring(
+                    fileName = destPath,
+                    progress = progress,
+                    uploadedBytes = offset.toLong(),
+                    totalBytes = totalBytes.toLong(),
+                    remainingBytes = (totalBytes - offset).toLong(),
+                    speedKbps = speed
+                )
 
-                // Open file in append/write mode
-                serialManager.sendCommand("_f = open('$destPath', 'wb')", timeoutMs = 2000)
+                delay(10)
+            }
 
-                while (offset < totalBytes) {
-                    val currentChunkSize = minOf(256, totalBytes - offset) // 256 bytes per REPL chunk
-                    val chunkBytes = bytes.copyOfRange(offset, offset + currentChunkSize)
-
-                    val hexStringBuilder = StringBuilder()
-                    for (b in chunkBytes) {
-                        hexStringBuilder.append(String.format("%02X", b))
-                    }
-                    val pyWrite = "_f.write(bytes.fromhex('$hexStringBuilder'))"
-                    serialManager.sendCommand(pyWrite, timeoutMs = 2500)
-
-                    offset += currentChunkSize
-                    val progressRatio = offset.toFloat() / totalBytes
-                    val elapsedSeconds = (System.currentTimeMillis() - startTime) / 1000f + 0.1f
-                    val speed = (offset / 1024f) / elapsedSeconds
-
-                    _transferState.value = TransferState.Transferring(
-                        fileName = destPath,
-                        progress = progressRatio,
-                        uploadedBytes = offset.toLong(),
-                        totalBytes = totalBytes.toLong(),
-                        remainingBytes = (totalBytes - offset).toLong(),
-                        speedKbps = speed
-                    )
-                }
-
-                serialManager.sendCommand("_f.close()", timeoutMs = 2000)
+            // 3. Complete Upload
+            val endResp = serialManager.sendCommand("FILE_UPLOAD_END", timeoutMs = 4000)
+            if (endResp.contains("READY", ignoreCase = true) || endResp.contains("OK", ignoreCase = true) || endResp.isEmpty()) {
                 _transferState.value = TransferState.Success(destPath)
-                serialManager.sendCommand(PicoProtocol.CMD_LIST_FILES)
+                serialManager.logSystem("Uploaded $destPath ($fileSizeBytes B) successfully.")
+                // Refresh directory index on device
+                serialManager.refreshFileList()
+            } else {
+                _transferState.value = TransferState.Failed("Device finalized upload with status: $endResp")
             }
         } catch (e: Exception) {
             _transferState.value = TransferState.Failed("Transfer exception: ${e.message}")
