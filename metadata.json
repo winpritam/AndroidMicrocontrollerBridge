@@ -1,0 +1,6 @@
+{
+  "name": "Picocase",
+  "description": "USB serial companion and MicroPython animation pipeline for ESP32, Raspberry Pi Pico, and OLED displays.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
